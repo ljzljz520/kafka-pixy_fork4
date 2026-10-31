@@ -1,7 +1,9 @@
 package admin
 
 import (
+	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/mailgun/kafka-pixy/actor"
@@ -38,6 +40,82 @@ func (s *AdminSuite) TearDownSuite(c *C) {
 
 func (s *AdminSuite) SetUpTest(c *C) {
 	s.ns = actor.Root().NewChild("T")
+}
+
+// AdminValidateSuite groups pure client-side validation checks. Unlike
+// AdminSuite it never connects to Kafka, so its tests are deterministic and
+// run without a Vagrant cluster.
+type AdminValidateSuite struct{}
+
+var _ = Suite(&AdminValidateSuite{})
+
+// validateCommitOffsets accepts every payload within the byte budget,
+// including exact-boundary metadata and empty payloads, and rejects an
+// over-budget block with a locate-able error (partition and sizes) before any
+// broker request could be made.
+func (s *AdminValidateSuite) TestValidateCommitOffsets(c *C) {
+	offsets := func(meta ...string) []PartitionOffset {
+		pos := make([]PartitionOffset, len(meta))
+		for i, m := range meta {
+			pos[i] = PartitionOffset{Partition: int32(i), Offset: int64(100 + i), Metadata: m}
+		}
+		return pos
+	}
+	for i, tc := range []struct {
+		desc          string
+		offsets       []PartitionOffset
+		maxSize       int
+		expectErr     bool
+		wantPartition int32
+	}{
+		0: {"empty payload accepted", nil, 4096, false, -1},
+		1: {"all blocks within budget accepted", offsets("a", "bb", "ccc"), 3, false, -1},
+		2: {"metadata of exactly max size accepted", offsets("aaa"), 3, false, -1},
+		3: {"first offending partition is reported", offsets("ok", "way-too-big"), 3, true, 1},
+		4: {"zero budget accepts empty metadata", offsets("", ""), 0, false, -1},
+		5: {"zero budget rejects non-empty metadata", offsets("x"), 0, true, 0},
+		6: {"negative budget disables the limit", offsets(strings.Repeat("x", 10000)), -1, false, -1},
+	} {
+		err := validateCommitOffsets(tc.offsets, tc.maxSize)
+		if !tc.expectErr {
+			c.Assert(err, IsNil, Commentf("case #%d: %s", i, tc.desc))
+			continue
+		}
+		c.Assert(err, NotNil, Commentf("case #%d: %s", i, tc.desc))
+		// The pre-request rejection is an invalid-parameter error, the same
+		// kind the HTTP/gRPC layers map to a client error.
+		_, ok := err.(ErrInvalidParam)
+		c.Assert(ok, Equals, true, Commentf("case #%d: %s", i, tc.desc))
+		msg := err.Error()
+		c.Assert(strings.Contains(msg, "offset metadata too large"), Equals, true,
+			Commentf("case #%d: %s", i, tc.desc))
+		c.Assert(strings.Contains(msg, fmt.Sprintf("partition=%d", tc.wantPartition)),
+			Equals, true, Commentf("case #%d: %s", i, tc.desc))
+		c.Assert(strings.Contains(msg, "max_size=3") || strings.Contains(msg, "max_size=0"),
+			Equals, true, Commentf("case #%d: %s", i, tc.desc))
+	}
+}
+
+// SetGroupOffsets rejects an over-budget payload before touching any broker
+// connection: with no Kafka seed peer configured the call still fails fast
+// with the locate-able invalid-parameter error rather than a connection error
+// or a client reset/retry.
+func (s *AdminValidateSuite) TestSetGroupOffsetsRejectsOverBudgetBeforeRequest(c *C) {
+	cfg := config.DefaultProxy()
+	cfg.Kafka.SeedPeers = nil
+	cfg.Consumer.MaxOffsetMetadataSize = 2
+	a, err := Spawn(actor.Root().NewChild("T"), cfg)
+	c.Assert(err, IsNil)
+	defer a.Stop()
+
+	err = a.SetGroupOffsets("g1", "t1", []PartitionOffset{
+		{Partition: 9, Offset: 1001, Metadata: "legal"},
+	})
+	c.Assert(err, NotNil)
+	_, ok := err.(ErrInvalidParam)
+	c.Assert(ok, Equals, true)
+	c.Assert(strings.Contains(err.Error(), "partition=9"), Equals, true)
+	c.Assert(strings.Contains(err.Error(), "max_size=2"), Equals, true)
 }
 
 // The end offset of partition ranges is properly reflects the number of

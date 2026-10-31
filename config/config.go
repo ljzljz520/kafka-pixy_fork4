@@ -247,6 +247,16 @@ type Proxy struct {
 		// How frequently to commit offsets to Kafka.
 		OffsetsCommitInterval time.Duration `yaml:"offsets_commit_interval"`
 
+		// The maximum size in bytes of the metadata string committed to Kafka
+		// along with a consumer offset. It must not exceed the broker setting
+		// `offset.metadata.max.bytes` (4096 by default). When sparse ack
+		// ranges do not fit into the budget, only the ranges closest to the
+		// continuous ack frontier are persisted; the dropped ranges stay in
+		// memory and, if the process restarts before they are reclaimed by
+		// the advancing frontier, the corresponding messages are redelivered
+		// (conservative duplicates, never lost unacknowledged messages).
+		MaxOffsetMetadataSize int `yaml:"max_offset_metadata_size"`
+
 		// Kafka-Pixy should wait this long after it gets notification that a
 		// consumer joined/left a consumer group it is a member of before
 		// rebalancing.
@@ -581,6 +591,8 @@ func (p *Proxy) validate() error {
 		return errors.New("consumer.max_retries must be >= -1")
 	case p.Consumer.OffsetsCommitInterval <= 0:
 		return errors.New("consumer.offsets_commit_interval must be > 0")
+	case p.Consumer.MaxOffsetMetadataSize <= 0:
+		return errors.New("consumer.max_offset_metadata_size must be > 0")
 	case p.Consumer.SubscriptionTimeout <= 0:
 		return errors.New("consumer.subscription_timeout must be > 0")
 	case p.Consumer.RetryBackoff <= 0:
@@ -679,6 +691,7 @@ func defaultProxyWithClientID(clientID string) *Proxy {
 	c.Consumer.MaxPendingMessages = 300
 	c.Consumer.MaxRetries = -1
 	c.Consumer.OffsetsCommitInterval = 500 * time.Millisecond
+	c.Consumer.MaxOffsetMetadataSize = 4096
 	c.Consumer.SubscriptionTimeout = 15 * time.Second
 	c.Consumer.RetryBackoff = 500 * time.Millisecond
 	return c

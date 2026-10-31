@@ -204,9 +204,37 @@ func (a *T) getGroupOffsets(group, topic string) ([]PartitionOffset, error) {
 // SetGroupOffsets commits specific offset values along with metadata for a list
 // of partitions of a particular topic on behalf of the specified group.
 func (a *T) SetGroupOffsets(group, topic string, offsets []PartitionOffset) error {
+	// Validate the payload before touching any broker connection. A payload
+	// exceeding the metadata budget would be deterministically rejected by
+	// the coordinator, so retrying it (and resetting the client) is
+	// pointless. The error identifies the offending partition.
+	if err := validateCommitOffsets(offsets, a.cfg.Consumer.MaxOffsetMetadataSize); err != nil {
+		return err
+	}
 	if err := a.setGroupOffsets(group, topic, offsets); err != nil {
 		a.ResetKafkaClt()
 		return a.setGroupOffsets(group, topic, offsets)
+	}
+	return nil
+}
+
+// validateCommitOffsets makes sure that every offset block can be committed
+// within the configured metadata byte budget. It is deliberately a pure
+// client-side check performed before any request is sent: the broker limit
+// (`offset.metadata.max.bytes`) is static configuration and the rejection
+// therefore deterministic for a given payload.
+func validateCommitOffsets(offsets []PartitionOffset, maxMetadataSize int) error {
+	if maxMetadataSize < 0 {
+		return nil
+	}
+	for _, po := range offsets {
+		if len(po.Metadata) > maxMetadataSize {
+			return ErrInvalidParam(errors.Errorf(
+				"offset metadata too large: partition=%d, metadata_size=%d, max_size=%d; "+
+					"reduce the metadata or raise consumer.max_offset_metadata_size to a value "+
+					"not exceeding the broker offset.metadata.max.bytes setting",
+				po.Partition, len(po.Metadata), maxMetadataSize))
+		}
 	}
 	return nil
 }

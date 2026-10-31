@@ -184,6 +184,12 @@ proxies:
       # How frequently to commit offsets to Kafka.
       offsets_commit_interval: 500ms
 
+      # Maximum size in bytes of metadata committed along with a consumer
+      # offset. Must not exceed the broker `offset.metadata.max.bytes`
+      # setting (4096 by default). Sparse ack ranges that do not fit stay
+      # in memory only and cause conservative redelivery after a restart.
+      max_offset_metadata_size: 4096
+
       # If a request to a Kafka-Pixy fails for any reason, then it should wait this
       # long before retrying.
       retry_backoff: 500ms

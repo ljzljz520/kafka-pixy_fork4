@@ -70,12 +70,43 @@ type T interface {
 	// block forever.
 	CommittedOffsets() <-chan Offset
 
+	// CommitErrors returns a channel to which rejected offset snapshots are
+	// sent. A rejection happens either locally, when a submitted metadata
+	// exceeds the configured client budget before a request is sent, or by
+	// the coordinator, when it replies with `ErrOffsetMetadataTooLarge`.
+	// Unlike connection failures such a rejection does not trigger a broker
+	// re-assignment or an automatic resend of the same payload: the caller
+	// is expected to shrink the snapshot metadata and submit a smaller
+	// offset. The channel must be read alongside `CommittedOffsets`.
+	CommitErrors() <-chan CommitError
+
 	// Stop stops the offset manager. It is required to stop all spawned offset
 	// managers before their parent factory can be stopped.
 	//
 	// It is guaranteed that the most recent offset is committed before `Stop`
 	// returns.
 	Stop()
+}
+
+// CommitError describes an offset snapshot that could not be committed
+// because its metadata was too large.
+type CommitError struct {
+	// Offset is the rejected snapshot.
+	Offset Offset
+
+	// Err is the rejection cause. For a coordinator rejection its cause is
+	// sarama.ErrOffsetMetadataTooLarge.
+	Err error
+
+	// Group, Topic and Partition identify the rejected commit.
+	Group     string
+	Topic     string
+	Partition int32
+
+	// Local is true if the snapshot was rejected before it was sent to the
+	// coordinator because its metadata exceeded the locally configured
+	// budget. No broker request was made in that case.
+	Local bool
 }
 
 // Offset represents an offset data as it is stored in Kafka, that is an offset
@@ -135,6 +166,7 @@ func (f *factory) Spawn(namespace *actor.Descriptor, group, topic string, partit
 		submitRequestsCh:   make(chan submitRq),
 		assignmentCh:       make(chan mapper.Executor, 1),
 		committedOffsetsCh: make(chan Offset, f.cfg.Consumer.ChannelBufferSize),
+		commitErrorsCh:     make(chan CommitError, f.cfg.Consumer.ChannelBufferSize),
 	}
 	if testReportErrors {
 		om.testErrorsCh = make(chan error, f.cfg.Consumer.ChannelBufferSize)
@@ -205,6 +237,7 @@ type offsetMgr struct {
 	submitRequestsCh      chan submitRq
 	assignmentCh          chan mapper.Executor
 	committedOffsetsCh    chan Offset
+	commitErrorsCh        chan CommitError
 	brokerRequestsCh      chan<- submitRq
 	nilOrBrokerRequestsCh chan<- submitRq
 	retryTimer            *time.Timer
@@ -229,6 +262,11 @@ func (om *offsetMgr) CommittedOffsets() <-chan Offset {
 }
 
 // implements `T`.
+func (om *offsetMgr) CommitErrors() <-chan CommitError {
+	return om.commitErrorsCh
+}
+
+// implements `T`.
 func (om *offsetMgr) Stop() {
 	close(om.submitRequestsCh)
 	om.wg.Wait()
@@ -245,6 +283,7 @@ func (om *offsetMgr) String() string {
 
 func (om *offsetMgr) run() {
 	defer close(om.committedOffsetsCh)
+	defer close(om.commitErrorsCh)
 	if om.testErrorsCh != nil {
 		defer close(om.testErrorsCh)
 	}
@@ -296,7 +335,7 @@ handleRequests:
 		latestRq.offset = committedOffset
 	}
 	if latestRq.offset != committedOffset {
-		om.nilOrBrokerRequestsCh = om.brokerRequestsCh
+		om.armSubmit(latestRq)
 	}
 	var submittedRq submitRq
 	var submittedAt time.Time
@@ -315,7 +354,7 @@ handleRequests:
 			om.brokerRequestsCh = be.requestsCh
 
 			if latestRq.offset != committedOffset {
-				om.nilOrBrokerRequestsCh = om.brokerRequestsCh
+				om.armSubmit(latestRq)
 			}
 		case rq, ok := <-nilOrRequestsCh:
 			if !ok {
@@ -333,7 +372,7 @@ handleRequests:
 			}
 			latestRq = rq
 			latestRq.resultCh = responseCh
-			om.nilOrBrokerRequestsCh = om.brokerRequestsCh
+			om.armSubmit(latestRq)
 
 		case om.nilOrBrokerRequestsCh <- latestRq:
 			om.nilOrBrokerRequestsCh = nil
@@ -345,6 +384,17 @@ handleRequests:
 			}
 		case rs := <-responseCh:
 			if err := om.getCommitError(rs); err != nil {
+				if errors.Cause(err) == sarama.ErrOffsetMetadataTooLarge {
+					// Metadata size is a property of the submitted payload,
+					// not of the broker connection: do not reassign the
+					// connection and do not resend the same request. Report
+					// it on the dedicated feedback channel instead, so the
+					// caller can submit a smaller snapshot. Other partitions
+					// of the same batched response keep being fanned out and
+					// committed independently.
+					om.rejectMetadata(rs.offset, err, false)
+					continue
+				}
 				om.triggerReassign(err, "Request failed")
 				continue
 			}
@@ -414,6 +464,45 @@ func (om *offsetMgr) fetchInitialOffset(conn *sarama.Broker) (Offset, error) {
 	}
 	fetchedOffset := Offset{block.Offset, block.Metadata}
 	return fetchedOffset, nil
+}
+
+// isMetadataOverBudget reports whether the metadata of the given snapshot
+// exceeds the locally configured commit metadata budget.
+func (om *offsetMgr) isMetadataOverBudget(offset Offset) bool {
+	maxSize := om.f.cfg.Consumer.MaxOffsetMetadataSize
+	return maxSize > 0 && len(offset.Meta) > maxSize
+}
+
+// armSubmit passes the latest request to the broker executor, unless its
+// metadata exceeds the local budget, in which case the snapshot is rejected
+// up-front via the dedicated feedback channel and no broker request is made.
+func (om *offsetMgr) armSubmit(rq submitRq) {
+	if om.isMetadataOverBudget(rq.offset) {
+		om.rejectMetadata(rq.offset, sarama.ErrOffsetMetadataTooLarge, true)
+		return
+	}
+	om.nilOrBrokerRequestsCh = om.brokerRequestsCh
+}
+
+// rejectMetadata is the feedback path for snapshots whose metadata is too
+// large. Unlike `triggerReassign` it neither closes/remaps the broker
+// connection nor re-arms the submission channel: resending the same payload
+// would fail the same way. It waits for the caller to submit a smaller
+// snapshot. The commit retry timer is cancelled as well.
+func (om *offsetMgr) rejectMetadata(rejected Offset, cause error, local bool) {
+	om.actDesc.Log().WithError(cause).Warnf(
+		"Offset commit rejected: metadata too large, size=%d, local=%t",
+		len(rejected.Meta), local)
+	om.stopRetryTimer()
+	om.nilOrBrokerRequestsCh = nil
+	om.commitErrorsCh <- CommitError{
+		Offset:    rejected,
+		Err:       cause,
+		Group:     om.id.group,
+		Topic:     om.id.topic,
+		Partition: om.id.partition,
+		Local:     local,
+	}
 }
 
 func (om *offsetMgr) getCommitError(rs submitRs) error {

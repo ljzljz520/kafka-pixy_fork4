@@ -150,7 +150,7 @@ func (s *PartitionCsmSuite) TestSparseAckedNotRead(c *C) {
 	// Make initial offset that has sparsely acked ranges.
 	oldestOffsets := s.kh.GetOldestOffsets(topic)
 	base := oldestOffsets[partition]
-	ot := offsettrk.New(s.ns, offsetmgr.Offset{Val: base}, -1)
+	ot := offsettrk.New(s.ns, offsetmgr.Offset{Val: base}, -1, 4096)
 	var initOffset offsetmgr.Offset
 	for i, acked := range ackedDlts {
 		if acked {

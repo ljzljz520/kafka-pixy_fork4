@@ -35,9 +35,24 @@ func init() {
 
 // T represents an entity that tracks offered and acknowledged messages and
 // maintains offset data for the current state.
+//
+// The tracker distinguishes two kinds of state:
+//
+//   - The complete acknowledgement state (`offset.Val` continuous ack frontier
+//     plus the full `ackedRanges` list) lives in memory only. It is used to
+//     suppress duplicate offers and to merge ranges as gaps get acknowledged.
+//   - A committable checkpoint (see `Checkpoint`) is what is safe to persist
+//     in Kafka: the continuous frontier plus only the complete acked ranges
+//     that fit into the metadata byte budget, preferentially keeping the
+//     ranges nearest the frontier. Ranges omitted from a checkpoint are not
+//     lost while the process lives (they remain in memory), but after a
+//     restart the corresponding already-processed messages may be redelivered.
+//     The continuous frontier never jumps over an unacknowledged gap, so
+//     unacknowledged messages are never skipped.
 type T struct {
 	actDesc      *actor.Descriptor
 	offerTimeout time.Duration
+	metaBudget   int
 	offset       offsetmgr.Offset
 	ackedRanges  []offsetRange
 	offers       []offer
@@ -59,11 +74,21 @@ func SparseAcks2Str(offset offsetmgr.Offset) string {
 	return buf.String()
 }
 
-// New creates a new offset tracker instance.
-func New(actDesc *actor.Descriptor, offset offsetmgr.Offset, offerTimeout time.Duration) *T {
+// New creates a new offset tracker instance. The metadata of the given
+// persisted offset is decoded using the historical sparse-acks encoding (no
+// format migration is performed), and maxMetaSize bounds the metadata of
+// every subsequently produced checkpoint:
+//
+//   - maxMetaSize < 0: no budget limit (unbounded encoding);
+//   - maxMetaSize == 0: only the continuous frontier is persisted;
+//   - maxMetaSize > 0: at most maxMetaSize bytes of complete acked ranges
+//     nearest the frontier are encoded as whole ranges, encoded bytes are
+//     never truncated mid-range.
+func New(actDesc *actor.Descriptor, offset offsetmgr.Offset, offerTimeout time.Duration, maxMetaSize int) *T {
 	ot := T{
 		actDesc:      actDesc,
 		offerTimeout: offerTimeout,
+		metaBudget:   maxMetaSize,
 		offset:       offset,
 	}
 	var err error
@@ -72,8 +97,51 @@ func New(actDesc *actor.Descriptor, offset offsetmgr.Offset, offerTimeout time.D
 		ot.ackedRanges = nil
 		ot.offset.Meta = ""
 		ot.actDesc.Log().WithError(err).Errorf("Bad sparse acks: %v", offset)
+	} else {
+		// Normalize the persisted snapshot so that the in-memory checkpoint is
+		// guaranteed to fit the budget. Encoding is deterministic, therefore
+		// metadata that already fits is rewritten byte for byte.
+		ot.offset.Meta = encodeAckedRanges(offset.Val, ot.ackedRanges, maxMetaSize)
 	}
 	return &ot
+}
+
+// Checkpoint returns the snapshot that is safe to persist for the current
+// state: the continuous ack frontier together with as many complete acked
+// ranges nearest the frontier as fit into the metadata byte budget. The
+// returned metadata is always decodable and never covers an unacknowledged
+// gap; ranges omitted from the snapshot are retained in memory.
+func (ot *T) Checkpoint() offsetmgr.Offset {
+	return offsetmgr.Offset{
+		Val:  ot.offset.Val,
+		Meta: encodeAckedRanges(ot.offset.Val, ot.ackedRanges, ot.metaBudget),
+	}
+}
+
+// ShrinkCheckpoint is called after a coordinator rejected the last submitted
+// checkpoint because its metadata was too large. It permanently tightens the
+// metadata budget (so the same payload is never resent) and returns the
+// resulting smaller checkpoint. It returns false when no complete range can
+// be dropped anymore, i.e. even the frontier-only checkpoint keeps getting
+// rejected, which means an unrecoverable broker/client configuration
+// mismatch. Every successful shrink returns a strictly smaller metadata
+// string, therefore the number of retries is bounded by the payload size.
+// Advancing the frontier later still reuses the tightened budget.
+func (ot *T) ShrinkCheckpoint() (offsetmgr.Offset, bool) {
+	current := ot.Checkpoint()
+	if len(current.Meta) == 0 {
+		return current, false
+	}
+	// Size the new budget against the rejected encoding so that the first
+	// retry already carries fewer ranges; converge to frontier-only rather
+	// than dividing the budget in lockstep.
+	newBudget := len(current.Meta) / 2
+	if ot.metaBudget > 0 && newBudget >= ot.metaBudget {
+		newBudget = ot.metaBudget / 2
+	}
+	ot.metaBudget = newBudget
+	shrunk := ot.Checkpoint()
+	return shrunk, len(shrunk.Meta) > 0
 }
 
 // Adjust adjusts the tracked offset. Offers with offsets lower then the new
@@ -131,7 +199,7 @@ func (ot *T) OnAcked(offset int64) (offsetmgr.Offset, int) {
 			offset, !offerRemoved, !ackedRangesUpdated)
 	}
 	if ackedRangesUpdated {
-		ot.offset.Meta = encodeAckedRanges(ot.offset.Val, ot.ackedRanges)
+		ot.offset = ot.Checkpoint()
 	}
 	return ot.offset, len(ot.offers)
 }
@@ -273,7 +341,7 @@ func (ot *T) correctOffset(offset int64) {
 		ot.ackedRanges = ot.ackedRanges[drop:]
 	}
 	ot.offset.Val = offset
-	ot.offset.Meta = encodeAckedRanges(offset, ot.ackedRanges)
+	ot.offset = ot.Checkpoint()
 }
 
 // updateAckedRanges updates acked ranges with a new acked offset. It returns
@@ -323,14 +391,26 @@ func (ot *T) updateAckedRanges(offset int64) bool {
 	return true
 }
 
-func encodeAckedRanges(base int64, ackedRanges []offsetRange) string {
+// encodeAckedRanges encodes the given acked ranges relative to base. Ranges
+// must be sorted and each of them represents a complete contiguous interval
+// of acknowledged offsets. If maxSize is non-negative then only the prefix
+// of ranges nearest the base (the ack frontier) that fits the budget is
+// encoded. Ranges are appended atomically: either both boundary varints of a
+// range make it into the output, or the range is omitted entirely; encoded
+// bytes are therefore never truncated in the middle of a token. A negative
+// maxSize means no budget limit.
+func encodeAckedRanges(base int64, ackedRanges []offsetRange, maxSize int) string {
 	ackedRangesCount := len(ackedRanges)
 	if ackedRangesCount == 0 {
 		return ""
 	}
 	buf := make([]byte, 0, ackedRangesCount*4)
 	for _, ar := range ackedRanges {
-		buf = ar.encode(base, buf)
+		encoded := ar.encode(base, nil)
+		if maxSize >= 0 && len(buf)+len(encoded) > maxSize {
+			break
+		}
+		buf = append(buf, encoded...)
 		base = ar.to
 	}
 	return string(buf)

@@ -49,11 +49,20 @@ type T struct {
 	wg          sync.WaitGroup
 
 	offsetMgr       offsetmgr.T
+	// committedOffset is the last snapshot acknowledged as persisted by the
+	// coordinator. It only advances when an offset comes from
+	// CommittedOffsets(); it is never moved merely because a snapshot has
+	// been submitted.
 	committedOffset offsetmgr.Offset
+	// submittedOffset is the latest in-memory checkpoint asked to be
+	// committed. It may encode fewer sparse ack ranges than the full in-memory
+	// state to stay within the metadata byte budget, and it may be ahead of
+	// committedOffset while a commit is in flight or being retried.
 	submittedOffset offsetmgr.Offset
 	offsetsOk       bool
 	offsetTrk       *offsettrk.T
 	offerCount      int32
+	stopping        bool
 
 	// For tests only!
 	firstMsgFetched bool
@@ -122,7 +131,8 @@ func (pc *T) run() {
 		return
 	}
 	pc.actDesc.Log().Infof("Initial offset: %s", offsetRepr(pc.committedOffset))
-	pc.offsetTrk = offsettrk.New(pc.actDesc, pc.committedOffset, pc.cfg.Consumer.AckTimeout)
+	pc.offsetTrk = offsettrk.New(pc.actDesc, pc.committedOffset, pc.cfg.Consumer.AckTimeout,
+		pc.cfg.Consumer.MaxOffsetMetadataSize)
 	pc.submittedOffset = pc.committedOffset
 	pc.offsetsOk = true
 	pc.notifyTestInitialized(pc.committedOffset)
@@ -141,6 +151,8 @@ func (pc *T) run() {
 				atomic.StoreInt32(&pc.offerCount, int32(offerCount))
 				pc.offsetMgr.SubmitOffset(pc.submittedOffset)
 			}
+		case commitErr := <-pc.offsetMgr.CommitErrors():
+			pc.handleCommitError(commitErr)
 		case <-time.After(timeout):
 			continue
 		}
@@ -234,6 +246,8 @@ func (pc *T) runFetchLoop() bool {
 				}
 			}
 		case pc.committedOffset = <-pc.offsetMgr.CommittedOffsets():
+		case commitErr := <-pc.offsetMgr.CommitErrors():
+			pc.handleCommitError(commitErr)
 		case <-pc.stopCh:
 			return false
 		}
@@ -263,17 +277,98 @@ func (pc *T) nextRetry() (consumer.Message, bool) {
 }
 
 func (pc *T) stopOffsetMgr() {
-	pc.offsetMgr.Stop()
 	if !pc.offsetsOk {
+		pc.offsetMgr.Stop()
 		return
 	}
-	// Drain committed offsets.
-	for pc.committedOffset = range pc.offsetMgr.CommittedOffsets() {
+	committedOffsetsCh := pc.offsetMgr.CommittedOffsets()
+	commitErrorsCh := pc.offsetMgr.CommitErrors()
+
+	// Keep the manager alive while the last submitted snapshot is not
+	// durably committed yet. A coordinator rejection arriving at shutdown
+	// must still be answered with a smaller checkpoint: once the manager is
+	// stopped its submit channel is closed and no smaller snapshot could be
+	// handed over anymore, which would make Stop wait forever. The number of
+	// such resubmits is bounded (see offsettrk.ShrinkCheckpoint).
+	for pc.committedOffset != pc.submittedOffset {
+		select {
+		case offset, ok := <-committedOffsetsCh:
+			if !ok {
+				committedOffsetsCh = nil
+			} else {
+				pc.committedOffset = offset
+			}
+		case commitErr, ok := <-commitErrorsCh:
+			if !ok {
+				commitErrorsCh = nil
+			} else {
+				pc.handleCommitError(commitErr)
+			}
+		}
 	}
-	if pc.committedOffset != pc.submittedOffset {
-		pc.actDesc.Log().Errorf("Failed to commit offset: %s", offsetRepr(pc.submittedOffset))
+
+	// Everything submitted is committed, so no rejection can be in flight
+	// anymore: drain the closing channels while the manager flushes.
+	pc.stopping = true
+	stopDone := make(chan none.T)
+	go func() {
+		pc.offsetMgr.Stop()
+		close(stopDone)
+	}()
+	for {
+		select {
+		case offset, ok := <-committedOffsetsCh:
+			if ok {
+				pc.committedOffset = offset
+			} else {
+				committedOffsetsCh = nil
+			}
+		case commitErr, ok := <-commitErrorsCh:
+			if ok {
+				pc.handleCommitError(commitErr)
+			} else {
+				commitErrorsCh = nil
+			}
+		case <-stopDone:
+			if pc.committedOffset != pc.submittedOffset {
+				pc.actDesc.Log().Errorf("Failed to commit offset: %s", offsetRepr(pc.submittedOffset))
+			}
+			pc.actDesc.Log().Infof("Last committed offset: %s", offsetRepr(pc.committedOffset))
+			return
+		}
 	}
-	pc.actDesc.Log().Infof("Last committed offset: %s", offsetRepr(pc.committedOffset))
+}
+
+// handleCommitError reacts on the offset manager feedback that the
+// coordinator rejected the last submitted snapshot because its metadata was too
+// large. This feedback path is distinct from connection failures: the broker
+// assignment is not remapped. Instead the tracker produces a strictly smaller
+// legal checkpoint that is resubmitted. If even the frontier-only snapshot is
+// rejected then the broker/client metadata budget configuration is
+// unrecoverably mismatched: the error is reported without ever resending the
+// same payload, unacknowledged offers stay pending and are never discarded.
+func (pc *T) handleCommitError(commitErr offsetmgr.CommitError) {
+	if pc.stopping {
+		// The submission channel is being closed, a smaller snapshot can no
+		// longer be handed to this offset manager instance.
+		pc.actDesc.Log().WithError(commitErr.Err).Errorf(
+			"Offset metadata rejected while stopping: %s", offsetRepr(commitErr.Offset))
+		return
+	}
+	retryOffset, retriable := pc.offsetTrk.ShrinkCheckpoint()
+	if !retriable {
+		pc.actDesc.Log().WithError(commitErr.Err).Errorf(
+			"Offset metadata rejected even for a frontier-only snapshot; the "+
+				"broker offset.metadata.max.bytes setting is below the usable "+
+				"minimum (unrecoverable configuration mismatch): rejected=%s",
+			offsetRepr(commitErr.Offset))
+		return
+	}
+	pc.actDesc.Log().WithError(commitErr.Err).Warnf(
+		"Offset metadata too large, submitting a smaller checkpoint: rejected=%s, retry=%s",
+		offsetRepr(commitErr.Offset), offsetRepr(retryOffset))
+	pc.submittedOffset = retryOffset
+	pc.offsetMgr.SubmitOffset(retryOffset)
 }
 
 // notifyTestInitialized sends initial offset to initialOffsetCh channel.
